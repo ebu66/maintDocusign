@@ -10,10 +10,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 概要
 
-Google スプレッドシートにバインドされた Google Apps Script（GAS、V8 ランタイム）のプロジェクト。機能は次の 2 つで、どちらも `チェッカ.js` に実装されている。
+Google スプレッドシートにバインドされた Google Apps Script（GAS、V8 ランタイム）のプロジェクト。機能は次の 3 つで、どれも `チェッカ.js` に実装されている。
 
 - **`checkGroupMembers`**：`共有事務グループ一覧` シートに載っているグループごとに、台帳シートのメンバーと GWS 上の Google グループのメンバーを比較する。差分を `検査結果` シートに出力し、結果をメールで通知する。
 - **`checkDocusignUsers`**：台帳のメールアドレスが Docusign のユーザーとして登録されているか（登録されていればそのステータス）を確認する。Docusign にあってどの台帳にもないユーザーとあわせて `Docusign確認結果` シートに出力する。メール通知はしない。
+- **`createMaintenanceSheet`**：台帳で C 列（更新対象）にチェックが付いたメンバーを、Docusign のユーザー一括更新用の 8 列の形式で `メンテナンス用CSV` シートに出力する。スプレッドシートのメニュー（`コード.js` の `onOpen`）から呼ばれる。外部サービスは呼ばない。
 
 <!--
 チェックの付いたメンバーの DocuSign ユーザー ID を DocuSign REST API で検索し、DocuSign のユーザーメンテナンス用 CSV データをシートに出力する。
@@ -22,9 +23,10 @@ Google スプレッドシートにバインドされた Google Apps Script（GAS
 
 ## コマンド
 
-ビルド・リント・テストの仕組みはない。`npm install` で入るのはエディタ補完用の `@types/google-apps-script` だけ（`jsconfig.json`、`checkJs: false`）。
+ビルド・リントの仕組みはない。`npm install` で入るのはエディタ補完用の `@types/google-apps-script` だけ（`jsconfig.json`、`checkJs: false`）。テストは Node 標準のテストランナー（`node:test`）で書いており、依存パッケージはない。
 
 ```sh
+npm test              # test/ のテストを実行する（ローカルだけで動き、本番には触れない）
 clasp status          # push でアップロードされるファイルを一覧表示（ルート直下の .js/.gs と appsscript.json）
 clasp push            # ローカルのファイルでリモートのプロジェクトを上書きする
 clasp pull            # リモートのプロジェクトを取得する。オンラインエディタでコードが変更された可能性があれば、編集前に実行する
@@ -32,31 +34,35 @@ clasp open-script     # Apps Script エディタを開く
 clasp open-container  # バインド先のスプレッドシートを開く
 ```
 
+- テストは、`test/helpers/gas.js` が `チェッカ.js` を Node の `vm` に読み込み、`SpreadsheetApp` を偽のスプレッドシートに差し替えて動かす。`UrlFetchApp`・`MailApp`・`AdminDirectory`・`Utilities` は触ると例外になる偽物なので、外部サービスを呼ぶ処理はこのままではテストできない。
+- `test/` は `.claspignore` で push 対象から外している。`.claspignore` を置くと clasp の既定の除外リストが置き換わるため、既定の内容（`appsscript.json` と `.gs`/`.js`/`.ts`/`.html` 以外、`.git/`、`node_modules/` を除外）も写してある。push したくないフォルダを増やしたら、ここに足すこと。
 - `.clasp.json`（スクリプト ID、`rootDir: ""`）は gitignore 対象だが、clasp の動作に必要。
 - push 先は `.clasp.json` のスクリプト 1 つだけで、テスト用のプロジェクトはない。push した内容はそのまま本番で動く。
-- 関数は Apps Script エディタかスプレッドシートのメニューから実行する。`clasp run` は GCP や API 実行可能ファイルの追加設定をしないと使えない。ローカルで実行・テストする手段はない。
-- 動作確認は、エディタで `checkGroupMembers` か `checkDocusignUsers` を実行し、実行ログと出力先のシートを見る。どちらも本番のスプレッドシート（`CHECKER_SPREADSHEET_ID`）と本番の Docusign を相手に動き、`checkGroupMembers` は実行するたびに `CHECKER_NOTIFY_TO` 宛てに実際にメールを送る。
+- 関数は Apps Script エディタかスプレッドシートのメニューから実行する。`clasp run` は GCP や API 実行可能ファイルの追加設定をしないと使えない。ローカルでは `npm test` の偽 GAS でしか動かせない。
+- 本番での動作確認は、`npm test` のあと、エディタかメニューで対象の関数を実行し、実行ログと出力先のシートを見る。どれも本番のスプレッドシート（`CHECKER_SPREADSHEET_ID`）に書き込む。`checkDocusignUsers` は本番の Docusign を呼び、`checkGroupMembers` は実行するたびに `CHECKER_NOTIFY_TO` 宛てに実際にメールを送る。
 
 ## アーキテクチャ
 
 使用する `.js` ファイルは `チェッカ.js` のみとする。他の `.js` ファイルは現時点では無視する。
-ただし `コード.js` の `getAllSheet` が `チェッカ.js` の `getDocusignUserId` を呼んでいるので、この関数は削除・改名しないこと。
+ただし `コード.js` の `onOpen` が、メニュー「⚙️ Docusign管理 → メンテナンス用データ作成」から `チェッカ.js` の `createMaintenanceSheet` を呼ぶので、この関数名は変えないこと。
+`getDocusignUserId` は、呼び出し元の `getAllSheet` を削除したため今はどこからも呼ばれていないが、残している。
 
-**GAS のグローバルスコープ。** すべての `.js` ファイルが 1 つのグローバル名前空間を共有する。import/export はなく、関数はファイルをまたいで呼び出される。`コード.js` も push されるので、その関数名（`onOpen`、`getAllSheet`、`putCSV`）と同じ名前を `チェッカ.js` で定義しないこと。
+**GAS のグローバルスコープ。** すべての `.js` ファイルが 1 つのグローバル名前空間を共有する。import/export はなく、関数はファイルをまたいで呼び出される。`コード.js` も push されるので、その関数名（`onOpen`、`putCSV`）と同じ名前を `チェッカ.js` で定義しないこと。
 ファイル名（`コード.js`、`チェッカ.js`）は日本語版 Apps Script エディタの既定名に由来する。ファイル名を変えるとリモートのプロジェクトも変わるので、変更しないこと。
 
 **メイン処理（`チェッカ.js`）。**
-詳細仕様は `spec.md` を参照すること。前半が Google グループとの比較、後半が Docusign 確認で、それぞれの先頭に `CHECKER_` で始まる定数をまとめている。
+詳細仕様は `spec.md` を参照すること。Google グループとの比較、Docusign 確認、メンテナンス用シートの生成の 3 つの節に分かれ、それぞれの先頭に `CHECKER_` で始まる定数をまとめている。
 
-- エディタから実行する入口は `checkGroupMembers` と `checkDocusignUsers`（と `コード.js` 用の `getDocusignUserId`）だけ。それ以外の関数名は `_` で終える（GAS では `_` で終わる関数はエディタの実行メニューに出ない private 関数になる）。
-- 2 つの機能で共有する関数：
+- 外から呼ぶ入口は `checkGroupMembers`、`checkDocusignUsers`、`createMaintenanceSheet`（と、今は使われていない `getDocusignUserId`）だけ。それ以外の関数名は `_` で終える（GAS では `_` で終わる関数はエディタの実行メニューに出ない private 関数になる）。
+- 複数の機能で共有する関数：
   - `readGroupList_`：`共有事務グループ一覧` の C/D/E 列 → グループ名称・グループのメールアドレス・台帳シート名
   - `readLedger_`：台帳シートの A/B 列 → メールアドレス → 氏名 の `Map`
   - `normalizeEmail_`：trim と小文字化。メールアドレスの比較・`Map` のキーは必ずこれを通す
   - `prepareResultSheet_`：結果シートがあればクリアし、なければ追加する
-- 一覧・台帳の見出し行や空行は、行番号ではなく「メールアドレス列に `@` を含むか」で除外している。
-- エラーはグループ単位で try/catch し、1 グループの失敗で全体を止めない。エラーは結果シートの一覧に行として出し、エラー件数に数える。処理を追加するときもこの方針に合わせる。
-- 結果シートは、A:B 列に集計（開始・終了時刻、件数など）を書き、1 行空けて一覧表を書く形式。
+- 一覧・台帳の見出し行や空行は、行番号ではなく「メールアドレス列に `@` を含むか」で除外している。ただし `createMaintenanceSheet` は、台帳の行を「C 列が `true` で B 列が空でないか」で選ぶ。
+- 検査の 2 つ（`checkGroupMembers`・`checkDocusignUsers`）は、エラーをグループ単位で try/catch し、1 グループの失敗で全体を止めない。エラーは結果シートの一覧に行として出し、エラー件数に数える。検査の処理を追加するときはこの方針に合わせる。
+- `createMaintenanceSheet` は逆に、見つからない台帳シートがあれば、`メンテナンス用CSV` に書き込む前にエラーで止まる（メニューから実行した人がすぐ気付けるように、一部だけの出力やエラー行は書かない）。
+- 検査の結果シートは、A:B 列に集計（開始・終了時刻、件数など）を書き、1 行空けて一覧表を書く形式。`メンテナンス用CSV` は集計を書かず、1 行目から見出しと一覧を書く。
 
 **外部サービス。**
 - Google グループのメンバーと表示名は、高度なサービス `AdminDirectory`（Admin SDK Directory API、`appsscript.json` で有効化）で取得する。実行ユーザーに Workspace の管理者権限が必要。

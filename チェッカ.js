@@ -241,7 +241,7 @@ function listDocusignUsers_(accessToken) {
 }
 
 // 指定したメールアドレスの Docusign ユーザー ID を返す。該当するユーザーがいない場合は "Not Found" を返す
-// （コード.js の getAllSheet から呼ばれる。aaa.js から移動）
+// （以前は コード.js の getAllSheet から呼ばれていたが、getAllSheet を削除したため、今はどこからも呼ばれていない）
 function getDocusignUserId(email) {
   if (!email) {
     return undefined;
@@ -353,4 +353,59 @@ function writeDocusignCheckResult_(ss, startTime, endTime, rows, notFoundCount, 
 
   const table = [['グループ名称', '氏名', 'メールアドレス', '台帳', 'Docusign登録', 'Docusignステータス']].concat(rows, docusignOnlyRows, errors);
   sheet.getRange(summary.length + 2, 1, table.length, table[0].length).setValues(table);
+}
+
+// ==========================================
+// メンテナンス用シートの生成（仕様は spec.md を参照）
+// ==========================================
+const CHECKER_MAINTENANCE_SHEET_NAME = 'メンテナンス用CSV';
+const CHECKER_MAINTENANCE_HEADER = ['UserEmail', 'APIUserName', 'FirstName', 'LastName', 'PermissionSet', 'CompanyName', 'Group', 'Language'];
+const CHECKER_MAINTENANCE_PERMISSION_SET = 'DS Sender';
+const CHECKER_MAINTENANCE_COMPANY_NAME = '株式会社ODKソリューションズ';
+const CHECKER_MAINTENANCE_LANGUAGE = 'ja';
+
+// スプレッドシートのメニュー（コード.js の onOpen）から呼ばれる
+function createMaintenanceSheet() {
+  const ss = SpreadsheetApp.openById(CHECKER_SPREADSHEET_ID);
+
+  // すべての台帳を読み終えてから書き込む。見つからないシートがあれば、メンテナンス用CSV を書き換えずに止まる
+  const rows = [];
+  readGroupList_(ss).forEach(group => {
+    rows.push(...readMaintenanceRows_(ss, group.ledgerSheetName));
+  });
+
+  const table = [CHECKER_MAINTENANCE_HEADER].concat(rows);
+  prepareResultSheet_(ss, CHECKER_MAINTENANCE_SHEET_NAME)
+    .getRange(1, 1, table.length, CHECKER_MAINTENANCE_HEADER.length)
+    .setValues(table);
+}
+
+// 台帳シートのうち、C列（更新対象）にチェックが付き、B列にメールアドレスがある行を、メンテナンス用CSV の行にする
+function readMaintenanceRows_(ss, sheetName) {
+  const sheet = ss.getSheetByName(sheetName);
+  if (!sheet) {
+    throw new Error(`台帳シート「${sheetName}」が見つかりません`);
+  }
+  return sheet.getDataRange().getValues()
+    .filter(row => row[2] === true && String(row[1]).trim() !== '') // 見出し行・空行・チェックなしの行を除く
+    .map(row => {
+      const name = splitPersonName_(row[0]);
+      return [
+        String(row[1]).trim(),
+        '', // APIUserName はとりあえず空欄
+        name.firstName,
+        name.lastName,
+        CHECKER_MAINTENANCE_PERMISSION_SET,
+        CHECKER_MAINTENANCE_COMPANY_NAME,
+        sheetName,
+        CHECKER_MAINTENANCE_LANGUAGE
+      ];
+    });
+}
+
+// 「姓 名」の順の氏名を姓と名に分ける。区切りは半角・全角のスペース（連続・混在してもよい）。
+// スペースがなければ氏名全体を姓とし、名は空にする
+function splitPersonName_(fullName) {
+  const parts = String(fullName).trim().split(/[ 　]+/);
+  return { lastName: parts[0], firstName: parts.slice(1).join(' ') };
 }
