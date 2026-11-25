@@ -136,9 +136,36 @@ function unexpectedService(serviceName) {
   });
 }
 
+// 偽の UrlFetchApp。respond(url, options) が { status, body } を返す（body は文字列かオブジェクト。オブジェクトは JSON にする）。
+// 呼ばれた URL とオプションは calls に残る。
+function createFakeUrlFetchApp(respond) {
+  const calls = [];
+  return {
+    calls,
+    fetch(url, options = {}) {
+      calls.push({ url, options });
+      const { status = 200, body = '' } = respond(url, options);
+      const text = typeof body === 'string' ? body : JSON.stringify(body);
+      return {
+        getResponseCode: () => status,
+        getContentText: () => text
+      };
+    }
+  };
+}
+
+// 偽の Utilities。Docusign の JWT の作成に使う関数だけを持つ（署名の中身は確かめない）
+function createFakeUtilities() {
+  return {
+    base64EncodeWebSafe: data => Buffer.from(typeof data === 'string' ? data : Uint8Array.from(data, b => b & 0xff)).toString('base64url'),
+    computeRsaSha256Signature: () => [1, 2, 3]
+  };
+}
+
 // チェッカ.js を読み込んだ vm のコンテキストを返す。
 // トップレベルの function はコンテキストのプロパティになるので、ctx.createMaintenanceSheet() のように呼べる。
-function loadChecker({ spreadsheet, properties = {} } = {}) {
+// UrlFetchApp・MailApp・AdminDirectory・Utilities は、既定では触ると例外になる。services で差し替えられる。
+function loadChecker({ spreadsheet, properties = {}, services = {} } = {}) {
   const messages = [];
   const record = level => (...args) => messages.push({ level, text: args.map(String).join(' ') });
 
@@ -162,10 +189,11 @@ function loadChecker({ spreadsheet, properties = {} } = {}) {
       info: record('info'),
       warn: record('warn'),
       error: record('error')
-    }
+    },
+    ...services
   });
   vm.runInContext(fs.readFileSync(CHECKER_PATH, 'utf8'), context, { filename: CHECKER_PATH });
   return context;
 }
 
-module.exports = { createFakeSpreadsheet, loadChecker };
+module.exports = { createFakeSpreadsheet, createFakeUrlFetchApp, createFakeUtilities, loadChecker };

@@ -164,6 +164,13 @@ const CHECKER_DOCUSIGN_RESULT_SHEET_NAME = 'Docusign確認結果';
 const CHECKER_DOCUSIGN_AUTH_SERVER = 'account.docusign.com'; // 本番環境（デモ環境は account-d.docusign.com）
 const CHECKER_DOCUSIGN_API_BASE_URL = 'https://na4.docusign.net/restapi/v2.1';
 const CHECKER_DOCUSIGN_USER_STATUSES = 'Active,ActivationSent,ActivationRequired,Closed,Disabled';
+// メールアドレスで検索して該当するユーザーがいないとき、Docusign は HTTP 400 とこの errorCode を返す（実機で確認）
+const CHECKER_DOCUSIGN_ERROR_USER_NOT_FOUND = 'USER_NOT_FOUND';
+
+// 1 回の実行の中で取得した Docusign のアクセストークン（getDocusignAccessToken_ が使い回す）。
+// GAS のグローバル変数は実行ごとに初期化されるので、次の実行では取り直す。
+// 1 回の実行は最大 6 分で、トークンの有効期限（1 時間）より短いため、期限切れは考えない。
+let checkerDocusignAccessToken = null;
 
 function checkDocusignUsers() {
   const startTime = new Date();
@@ -204,8 +211,9 @@ function checkDocusignUsers() {
   writeDocusignCheckResult_(ss, startTime, endTime, rows, notFoundCount, docusignOnlyRows, errors);
 }
 
-// Docusign アカウントの全ユーザーを取得し、メールアドレス → { name: ユーザー名, statuses: ステータスの配列 } の Map にする
-// （同じメールアドレスで複数のユーザーが登録されていることがあるため、ステータスは配列で持つ）
+// Docusign アカウントの全ユーザーを取得し、
+// メールアドレス → { name: ユーザー名, statuses: ステータスの配列, accounts: [{ userId, status }] } の Map にする
+// （同じメールアドレスで複数のユーザーが登録されていることがあるため、ステータスとユーザーは配列で持つ）
 function listDocusignUsers_(accessToken) {
   const accountId = PropertiesService.getScriptProperties().getProperty('DS_ACCOUNT_ID');
   const docusignUsers = new Map();
@@ -228,10 +236,11 @@ function listDocusignUsers_(accessToken) {
         return;
       }
       const email = normalizeEmail_(user.email);
-      const entry = docusignUsers.get(email) || { name: user.userName || '', statuses: [] };
+      const entry = docusignUsers.get(email) || { name: user.userName || '', statuses: [], accounts: [] };
       if (!entry.statuses.includes(user.userStatus)) {
         entry.statuses.push(user.userStatus);
       }
+      entry.accounts.push({ userId: user.userId, status: user.userStatus });
       docusignUsers.set(email, entry);
     });
     startPosition += pageUsers.length;
@@ -240,9 +249,12 @@ function listDocusignUsers_(accessToken) {
   return docusignUsers;
 }
 
-// 指定したメールアドレスの Docusign ユーザー ID を返す。該当するユーザーがいない場合は "Not Found" を返す
-// （以前は コード.js の getAllSheet から呼ばれていたが、getAllSheet を削除したため、今はどこからも呼ばれていない）
-function getDocusignUserId(email) {
+// 指定したメールアドレスの Docusign ユーザー ID を返す。
+// 該当するユーザーがいない場合は "Not Found"、メールアドレスが空の場合は undefined を返す。
+// 該当なし（HTTP 400 と USER_NOT_FOUND）以外で、Docusign の応答が 200 以外のときはエラーにする
+// （「該当なし」と「確認できなかった」を区別するため）。
+// （今はどこからも呼ばれていないが、今後使うため残している内部関数）
+function getDocusignUserId_(email) {
   if (!email) {
     return undefined;
   }
@@ -254,12 +266,32 @@ function getDocusignUserId(email) {
     headers: { Authorization: `Bearer ${accessToken}` },
     muteHttpExceptions: true
   });
+  const status = response.getResponseCode();
+  if (status === 400 && getDocusignErrorCode_(response) === CHECKER_DOCUSIGN_ERROR_USER_NOT_FOUND) {
+    return 'Not Found';
+  }
+  if (status !== 200) {
+    throw new Error(`Docusign のユーザー検索（${email}）に失敗しました（HTTP ${status}）: ${response.getContentText()}`);
+  }
   const data = JSON.parse(response.getContentText());
   return data.users && data.users.length > 0 ? data.users[0].userId : 'Not Found';
 }
 
+// Docusign のエラー応答の本文から errorCode を取り出す。本文が JSON でなければ空文字を返す
+function getDocusignErrorCode_(response) {
+  try {
+    return JSON.parse(response.getContentText()).errorCode || '';
+  } catch (e) {
+    return '';
+  }
+}
+
 // JWT Grant 認証で Docusign のアクセストークンを取得する（aaa.js の getDocusignAccessToken から移植）
+// 同じ実行の中で 2 回目以降に呼ばれたときは、最初に取得したトークンをそのまま返す
 function getDocusignAccessToken_() {
+  if (checkerDocusignAccessToken) {
+    return checkerDocusignAccessToken;
+  }
   const props = PropertiesService.getScriptProperties();
   const now = Math.floor(Date.now() / 1000);
   const header = { alg: 'RS256', typ: 'JWT' };
@@ -288,7 +320,8 @@ function getDocusignAccessToken_() {
   if (response.getResponseCode() !== 200) {
     throw new Error('Docusign のアクセストークンの取得に失敗しました: ' + response.getContentText());
   }
-  return JSON.parse(response.getContentText()).access_token;
+  checkerDocusignAccessToken = JSON.parse(response.getContentText()).access_token;
+  return checkerDocusignAccessToken;
 }
 
 // GAS の computeRsaSha256Signature は PKCS#8 形式の鍵しか受け付けないため、
@@ -363,16 +396,45 @@ const CHECKER_MAINTENANCE_HEADER = ['UserEmail', 'APIUserName', 'FirstName', 'La
 const CHECKER_MAINTENANCE_PERMISSION_SET = 'DS Sender';
 const CHECKER_MAINTENANCE_COMPANY_NAME = '株式会社ODKソリューションズ';
 const CHECKER_MAINTENANCE_LANGUAGE = 'ja';
+// APIUserName に使う Docusign ユーザーのステータス（優先する順）。これ以外のステータスのユーザーしかいない人は出力しない
+const CHECKER_MAINTENANCE_USER_STATUSES = ['ActivationSent', 'Active'];
 
-// スプレッドシートのメニュー（コード.js の onOpen）から呼ばれる
+// スプレッドシートのメニュー（コード.js の onOpen）から呼ばれる。
+// 既存の Docusign ユーザーの情報を補完するための CSV を作る（ユーザーの作成は GWS からのプロビジョニングで行う）
 function createMaintenanceSheet() {
   const ss = SpreadsheetApp.openById(CHECKER_SPREADSHEET_ID);
 
-  // すべての台帳を読み終えてから書き込む。見つからないシートがあれば、メンテナンス用CSV を書き換えずに止まる
-  const rows = [];
+  // 先にすべての台帳を読む。見つからないシートがあれば、Docusign を呼ぶ前に止まる
+  const ledgerRows = [];
   readGroupList_(ss).forEach(group => {
-    rows.push(...readMaintenanceRows_(ss, group.ledgerSheetName));
+    ledgerRows.push(...readMaintenanceLedgerRows_(ss, group.ledgerSheetName));
   });
+  // 同じメールアドレスは 1 人にまとめ、どこかの台帳でチェックが付いている人だけを対象にする
+  const targets = mergeMaintenanceTargets_(ledgerRows);
+
+  // Docusign の全ユーザーを一括で取得し、ユーザー ID が決まった人だけを出力する。
+  // ID を決められない人がいるとエラーで止まるので、メンテナンス用CSV は書き換えない
+  const rows = [];
+  if (targets.length > 0) {
+    const docusignUsers = listDocusignUsers_(getDocusignAccessToken_());
+    targets.forEach(target => {
+      const userId = selectMaintenanceUserId_(docusignUsers.get(normalizeEmail_(target.email)), target.email);
+      if (!userId) {
+        console.log(`${target.email}（${target.groups.join(',')}）: Docusign に ${CHECKER_MAINTENANCE_USER_STATUSES.join('・')} のユーザーがいないため、出力しません`);
+        return;
+      }
+      rows.push([
+        target.email,
+        userId,
+        target.firstName,
+        target.lastName,
+        CHECKER_MAINTENANCE_PERMISSION_SET,
+        CHECKER_MAINTENANCE_COMPANY_NAME,
+        target.groups.join(','),
+        CHECKER_MAINTENANCE_LANGUAGE
+      ]);
+    });
+  }
 
   const table = [CHECKER_MAINTENANCE_HEADER].concat(rows);
   prepareResultSheet_(ss, CHECKER_MAINTENANCE_SHEET_NAME)
@@ -380,27 +442,73 @@ function createMaintenanceSheet() {
     .setValues(table);
 }
 
-// 台帳シートのうち、C列（更新対象）にチェックが付き、B列にメールアドレスがある行を、メンテナンス用CSV の行にする
-function readMaintenanceRows_(ss, sheetName) {
+// 台帳シートのうち、B列にメールアドレスがある行を、チェックの有無にかかわらず
+// { email, checked: C列（更新対象）のチェック, firstName, lastName, sheetName } の配列にする
+function readMaintenanceLedgerRows_(ss, sheetName) {
   const sheet = ss.getSheetByName(sheetName);
   if (!sheet) {
     throw new Error(`台帳シート「${sheetName}」が見つかりません`);
   }
   return sheet.getDataRange().getValues()
-    .filter(row => row[2] === true && String(row[1]).trim() !== '') // 見出し行・空行・チェックなしの行を除く
+    .filter(row => String(row[1]).trim() !== '') // 空行を除く（見出し行はチェックがないので、後で対象外になる）
     .map(row => {
       const name = splitPersonName_(row[0]);
-      return [
-        String(row[1]).trim(),
-        '', // APIUserName はとりあえず空欄
-        name.firstName,
-        name.lastName,
-        CHECKER_MAINTENANCE_PERMISSION_SET,
-        CHECKER_MAINTENANCE_COMPANY_NAME,
-        sheetName,
-        CHECKER_MAINTENANCE_LANGUAGE
-      ];
+      return {
+        email: String(row[1]).trim(),
+        checked: row[2] === true,
+        firstName: name.firstName,
+        lastName: name.lastName,
+        sheetName: sheetName
+      };
     });
+}
+
+// 台帳の行を、メールアドレス（大文字・小文字は区別しない）ごとに 1 人にまとめ、
+// { email, firstName, lastName, groups: 台帳シート名の配列 } の配列にする。
+// - どの台帳でもチェックが付いていない人は含めない
+// - メールアドレスと氏名は、最初にチェックが付いている行の値を使う
+// - groups は、チェックの有無にかかわらず、そのメールアドレスがある台帳シート名を、出てくる順に重複なく並べる
+// - 並びは、そのメールアドレスが最初に出てくる位置の順
+function mergeMaintenanceTargets_(ledgerRows) {
+  const byEmail = new Map();
+  ledgerRows.forEach(row => {
+    const key = normalizeEmail_(row.email);
+    const entry = byEmail.get(key) || { person: null, groups: [] };
+    if (!entry.groups.includes(row.sheetName)) {
+      entry.groups.push(row.sheetName);
+    }
+    if (row.checked && !entry.person) {
+      entry.person = { email: row.email, firstName: row.firstName, lastName: row.lastName };
+    }
+    byEmail.set(key, entry);
+  });
+  return Array.from(byEmail.values())
+    .filter(entry => entry.person)
+    .map(entry => ({
+      email: entry.person.email,
+      firstName: entry.person.firstName,
+      lastName: entry.person.lastName,
+      groups: entry.groups
+    }));
+}
+
+// listDocusignUsers_ の 1 人分（同じメールアドレスの Docusign ユーザー）から、APIUserName に使うユーザー ID を選ぶ。
+// CHECKER_MAINTENANCE_USER_STATUSES の順に探し、どれもいなければ null を返す（その人は出力しない）。
+// 同じステータスのユーザーが複数いると ID を決められないので、エラーにする
+function selectMaintenanceUserId_(docusignUser, email) {
+  if (!docusignUser) {
+    return null;
+  }
+  for (const status of CHECKER_MAINTENANCE_USER_STATUSES) {
+    const accounts = docusignUser.accounts.filter(account => account.status === status);
+    if (accounts.length > 1) {
+      throw new Error(`Docusign に ${email} の ${status} のユーザーが ${accounts.length} 人いるため、ユーザー ID を決められません`);
+    }
+    if (accounts.length === 1) {
+      return accounts[0].userId;
+    }
+  }
+  return null;
 }
 
 // 「姓 名」の順の氏名を姓と名に分ける。区切りは半角・全角のスペース（連続・混在してもよい）。
