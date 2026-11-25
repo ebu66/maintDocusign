@@ -82,7 +82,9 @@ clasp open-container  # バインド先のスプレッドシートを開く
 ## 注意点
 
 - GAS の 1 回の実行時間は最大 6 分。`checkGroupMembers` は「Googleグループのみにあり」のメンバーごとに Directory API を 1 回呼ぶ（`getMemberDisplayName_`）ので、グループや差分が増えると時間がかかる。
-- OAuth スコープは `appsscript.json` に書かず、自動検出に任せている。新しいサービスを使うコードを push すると、次回の実行時に再承認が必要になる。
+- OAuth スコープは `appsscript.json` の `oauthScopes` に明示している。明示すると自動検出は働かないので、新しいサービスや API を使うとき（`コード.js` 側も含む）は、ここにスコープを追加すること。書き忘れても push の時点では分からず、実行時に権限不足のエラーになる。
+- Admin SDK のスコープは読み取り専用（`.readonly`）だけにしている。グループやユーザーを変更する処理は、今のスコープでは動かない。
+- スコープを変えて push したら、トリガーを作ったアカウント（Workspace 管理者）でエディタから関数を 1 回実行し、承認し直すこと。承認するまで、週 1 回のトリガー実行は失敗する。
 
 <!--
 - `getDocusignUserInfo` は該当ユーザーがいないと文字列 `"Not Found"` を返す。この文字列は truthy なので `getAllSheet` の `if (userId)` では除外されず、未登録のユーザーも `APIUserName = "Not Found"` のまま CSV に出力される。
