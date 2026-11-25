@@ -9,7 +9,13 @@ const { createFakeSpreadsheet, createFakeUrlFetchApp, createFakeUtilities, loadC
 
 const GROUP_LIST = '共有事務グループ一覧';
 const CSV = 'メンテナンス用CSV';
-const CSV_HEADER = ['UserEmail', 'APIUserName', 'FirstName', 'LastName', 'PermissionSet', 'CompanyName', 'Group', 'Language'];
+// メンテナンス用CSV の見出し。Group 列は部署の数だけ並ぶ
+const csvHeader = (groupColumns = 1) => [
+  'UserEmail', 'APIUserName', 'FirstName', 'LastName', 'PermissionSet', 'CompanyName',
+  ...Array(groupColumns).fill('Group'),
+  'Language'
+];
+const CSV_HEADER = csvHeader(1);
 const LEDGER_HEADER = ['氏名', 'メールアドレス', '更新対象'];
 
 const TOKEN_URL = 'https://account.docusign.com/oauth/token';
@@ -41,9 +47,15 @@ function ledger(...rows) {
 // 特に指定しないテストで使う、Docusign のユーザー ID
 const idOf = email => `id-${email}`;
 
-// メンテナンス用CSV の 1 行。userId を省くと idOf(email) になる
-function csvRow(email, firstName, lastName, group, userId = idOf(email)) {
-  return [email, userId, firstName, lastName, 'DS Sender', '株式会社ODKソリューションズ', group, 'ja'];
+// メンテナンス用CSV の 1 行。groups は部署名か部署名の配列。
+// userId を省く（undefined）と idOf(email) になる。groupColumns を省くと部署の数と同じ（余った Group 列は空欄）
+function csvRow(email, firstName, lastName, groups, userId = idOf(email), groupColumns = [].concat(groups).length) {
+  const groupList = [].concat(groups);
+  return [
+    email, userId, firstName, lastName, 'DS Sender', '株式会社ODKソリューションズ',
+    ...groupList, ...Array(groupColumns - groupList.length).fill(''),
+    'ja'
+  ];
 }
 
 // Docusign のユーザー一覧 API が返すユーザー 1 人分
@@ -483,7 +495,7 @@ describe('createMaintenanceSheet', () => {
       ]);
     });
 
-    test('すべての台帳でチェックが付いていれば、1 行にまとめ、部署を「,」区切りでつなぐ', () => {
+    test('複数の台帳でチェックが付いていれば、1 行にまとめ、Group 列を追加して部署を 1 つずつ並べる', () => {
       const { spreadsheet, gas } = setup({
         [GROUP_LIST]: groupList('経理', '総務'),
         '経理': ledger(['吉田 翔', 'yoshida@example.com', true]),
@@ -493,28 +505,51 @@ describe('createMaintenanceSheet', () => {
       gas.createMaintenanceSheet();
 
       assert.deepEqual(spreadsheet.valuesOf(CSV), [
-        CSV_HEADER,
-        csvRow('yoshida@example.com', '翔', '吉田', '経理,総務')
+        csvHeader(2),
+        csvRow('yoshida@example.com', '翔', '吉田', ['経理', '総務'])
       ]);
     });
 
-    test('チェックの有無が混在していれば、チェックのない部署も含めて「,」区切りでつなぐ', () => {
+    test('チェックの有無が混在していれば、チェックのある部署だけを出力する', () => {
       const { spreadsheet, gas } = setup({
         [GROUP_LIST]: groupList('経理', '総務', '人事'),
-        '経理': ledger(['吉田 翔', 'yoshida@example.com', false]),
-        '総務': ledger(['吉田 翔', 'yoshida@example.com', true]),
-        '人事': ledger(['吉田 翔', 'yoshida@example.com', false])
+        '経理': ledger(['吉田 翔', 'yoshida@example.com', true]),
+        '総務': ledger(['吉田 翔', 'yoshida@example.com', false]),
+        '人事': ledger(['吉田 翔', 'yoshida@example.com', true])
       });
 
       gas.createMaintenanceSheet();
 
       assert.deepEqual(spreadsheet.valuesOf(CSV), [
-        CSV_HEADER,
-        csvRow('yoshida@example.com', '翔', '吉田', '経理,総務,人事')
+        csvHeader(2),
+        csvRow('yoshida@example.com', '翔', '吉田', ['経理', '人事'])
       ]);
     });
 
-    test('1 行にまとめた人は、そのメールアドレスが最初に出てくる位置に出力する', () => {
+    test('Group 列の数は部署がいちばん多い人に合わせ、部署の少ない人の残りの Group 列は空欄にする', () => {
+      const { spreadsheet, gas } = setup({
+        [GROUP_LIST]: groupList('経理', '総務'),
+        '経理': ledger(
+          ['吉田 翔', 'yoshida@example.com', true],
+          ['田中 美咲', 'tanaka@example.com', true]
+        ),
+        '総務': ledger(
+          ['山本 健', 'yamamoto@example.com', true],
+          ['吉田 翔', 'yoshida@example.com', true]
+        )
+      });
+
+      gas.createMaintenanceSheet();
+
+      assert.deepEqual(spreadsheet.valuesOf(CSV), [
+        csvHeader(2),
+        csvRow('yoshida@example.com', '翔', '吉田', ['経理', '総務']),
+        csvRow('tanaka@example.com', '美咲', '田中', '経理', undefined, 2),
+        csvRow('yamamoto@example.com', '健', '山本', '総務', undefined, 2)
+      ]);
+    });
+
+    test('1 行にまとめた人は、最初にチェックが付いた行の位置に出力する（チェックのない行は位置にも数えない）', () => {
       const { spreadsheet, gas } = setup({
         [GROUP_LIST]: groupList('経理', '総務'),
         '経理': ledger(
@@ -531,9 +566,9 @@ describe('createMaintenanceSheet', () => {
 
       assert.deepEqual(spreadsheet.valuesOf(CSV), [
         CSV_HEADER,
-        csvRow('yoshida@example.com', '翔', '吉田', '経理,総務'),
         csvRow('tanaka@example.com', '美咲', '田中', '経理'),
-        csvRow('yamamoto@example.com', '健', '山本', '総務')
+        csvRow('yamamoto@example.com', '健', '山本', '総務'),
+        csvRow('yoshida@example.com', '翔', '吉田', '総務')
       ]);
     });
 
@@ -550,17 +585,17 @@ describe('createMaintenanceSheet', () => {
       gas.createMaintenanceSheet();
 
       assert.deepEqual(spreadsheet.valuesOf(CSV), [
-        CSV_HEADER,
-        csvRow('yoshida@example.com', '翔太', '吉田', '経理,総務,人事', 'guid-1')
+        csvHeader(2),
+        csvRow('yoshida@example.com', '翔太', '吉田', ['総務', '人事'], 'guid-1')
       ]);
     });
 
-    test('同じ台帳に同じメールアドレスが 2 行あっても、部署名は 1 回だけにする', () => {
+    test('同じ台帳に同じメールアドレスが 2 行チェックされていても、部署名は 1 回だけにする', () => {
       const { spreadsheet, gas } = setup({
         [GROUP_LIST]: groupList('経理'),
         '経理': ledger(
           ['吉田 翔', 'yoshida@example.com', true],
-          ['吉田 翔', 'yoshida@example.com', false]
+          ['吉田 翔', 'yoshida@example.com', true]
         )
       });
 

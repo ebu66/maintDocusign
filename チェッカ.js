@@ -392,7 +392,11 @@ function writeDocusignCheckResult_(ss, startTime, endTime, rows, notFoundCount, 
 // メンテナンス用シートの生成（仕様は spec.md を参照）
 // ==========================================
 const CHECKER_MAINTENANCE_SHEET_NAME = 'メンテナンス用CSV';
-const CHECKER_MAINTENANCE_HEADER = ['UserEmail', 'APIUserName', 'FirstName', 'LastName', 'PermissionSet', 'CompanyName', 'Group', 'Language'];
+// 見出しは「Group より前の列」＋「Group を部署の数だけ」＋「Group より後の列」。
+// Docusign の CSV では、ユーザーを複数のグループに入れるときは Group 列を増やす（1 つのセルに区切って入れない）
+const CHECKER_MAINTENANCE_HEADER_BEFORE_GROUPS = ['UserEmail', 'APIUserName', 'FirstName', 'LastName', 'PermissionSet', 'CompanyName'];
+const CHECKER_MAINTENANCE_GROUP_HEADER = 'Group';
+const CHECKER_MAINTENANCE_HEADER_AFTER_GROUPS = ['Language'];
 const CHECKER_MAINTENANCE_PERMISSION_SET = 'DS Sender';
 const CHECKER_MAINTENANCE_COMPANY_NAME = '株式会社ODKソリューションズ';
 const CHECKER_MAINTENANCE_LANGUAGE = 'ja';
@@ -405,91 +409,79 @@ function createMaintenanceSheet() {
   const ss = SpreadsheetApp.openById(CHECKER_SPREADSHEET_ID);
 
   // 先にすべての台帳を読む。見つからないシートがあれば、Docusign を呼ぶ前に止まる
-  const ledgerRows = [];
+  const checkedRows = [];
   readGroupList_(ss).forEach(group => {
-    ledgerRows.push(...readMaintenanceLedgerRows_(ss, group.ledgerSheetName));
+    checkedRows.push(...readCheckedLedgerRows_(ss, group.ledgerSheetName));
   });
-  // 同じメールアドレスは 1 人にまとめ、どこかの台帳でチェックが付いている人だけを対象にする
-  const targets = mergeMaintenanceTargets_(ledgerRows);
+  // 同じメールアドレスは 1 人にまとめ、チェックが付いている台帳シート名を部署として持つ
+  const targets = mergeMaintenanceTargets_(checkedRows);
 
   // Docusign の全ユーザーを一括で取得し、ユーザー ID が決まった人だけを出力する。
   // ID を決められない人がいるとエラーで止まるので、メンテナンス用CSV は書き換えない
-  const rows = [];
+  const people = [];
   if (targets.length > 0) {
     const docusignUsers = listDocusignUsers_(getDocusignAccessToken_());
     targets.forEach(target => {
       const userId = selectMaintenanceUserId_(docusignUsers.get(normalizeEmail_(target.email)), target.email);
       if (!userId) {
-        console.log(`${target.email}（${target.groups.join(',')}）: Docusign に ${CHECKER_MAINTENANCE_USER_STATUSES.join('・')} のユーザーがいないため、出力しません`);
+        console.log(`${target.email}（${target.groups.join('、')}）: Docusign に ${CHECKER_MAINTENANCE_USER_STATUSES.join('・')} のユーザーがいないため、出力しません`);
         return;
       }
-      rows.push([
-        target.email,
-        userId,
-        target.firstName,
-        target.lastName,
-        CHECKER_MAINTENANCE_PERMISSION_SET,
-        CHECKER_MAINTENANCE_COMPANY_NAME,
-        target.groups.join(','),
-        CHECKER_MAINTENANCE_LANGUAGE
-      ]);
+      people.push({ target: target, userId: userId });
     });
   }
 
-  const table = [CHECKER_MAINTENANCE_HEADER].concat(rows);
+  // Group 列の数は、部署がいちばん多い人に合わせる（足りない人の残りの Group 列は空欄）
+  const groupColumnCount = Math.max(1, ...people.map(person => person.target.groups.length));
+  const header = CHECKER_MAINTENANCE_HEADER_BEFORE_GROUPS
+    .concat(new Array(groupColumnCount).fill(CHECKER_MAINTENANCE_GROUP_HEADER), CHECKER_MAINTENANCE_HEADER_AFTER_GROUPS);
+  const rows = people.map(({ target, userId }) => [
+    target.email,
+    userId,
+    target.firstName,
+    target.lastName,
+    CHECKER_MAINTENANCE_PERMISSION_SET,
+    CHECKER_MAINTENANCE_COMPANY_NAME
+  ].concat(target.groups, new Array(groupColumnCount - target.groups.length).fill(''), [CHECKER_MAINTENANCE_LANGUAGE]));
+
+  const table = [header].concat(rows);
   prepareResultSheet_(ss, CHECKER_MAINTENANCE_SHEET_NAME)
-    .getRange(1, 1, table.length, CHECKER_MAINTENANCE_HEADER.length)
+    .getRange(1, 1, table.length, header.length)
     .setValues(table);
 }
 
-// 台帳シートのうち、B列にメールアドレスがある行を、チェックの有無にかかわらず
-// { email, checked: C列（更新対象）のチェック, firstName, lastName, sheetName } の配列にする
-function readMaintenanceLedgerRows_(ss, sheetName) {
+// 台帳シートのうち、C列（更新対象）にチェックが付き、B列にメールアドレスがある行を、
+// { email, firstName, lastName, sheetName } の配列にする（チェックのない行は出力対象外なので読まない）
+function readCheckedLedgerRows_(ss, sheetName) {
   const sheet = ss.getSheetByName(sheetName);
   if (!sheet) {
     throw new Error(`台帳シート「${sheetName}」が見つかりません`);
   }
   return sheet.getDataRange().getValues()
-    .filter(row => String(row[1]).trim() !== '') // 空行を除く（見出し行はチェックがないので、後で対象外になる）
+    .filter(row => row[2] === true && String(row[1]).trim() !== '') // 見出し行・空行・チェックなしの行を除く
     .map(row => {
       const name = splitPersonName_(row[0]);
-      return {
-        email: String(row[1]).trim(),
-        checked: row[2] === true,
-        firstName: name.firstName,
-        lastName: name.lastName,
-        sheetName: sheetName
-      };
+      return { email: String(row[1]).trim(), firstName: name.firstName, lastName: name.lastName, sheetName: sheetName };
     });
 }
 
-// 台帳の行を、メールアドレス（大文字・小文字は区別しない）ごとに 1 人にまとめ、
+// チェックが付いた台帳の行を、メールアドレス（大文字・小文字は区別しない）ごとに 1 人にまとめ、
 // { email, firstName, lastName, groups: 台帳シート名の配列 } の配列にする。
-// - どの台帳でもチェックが付いていない人は含めない
-// - メールアドレスと氏名は、最初にチェックが付いている行の値を使う
-// - groups は、チェックの有無にかかわらず、そのメールアドレスがある台帳シート名を、出てくる順に重複なく並べる
-// - 並びは、そのメールアドレスが最初に出てくる位置の順
-function mergeMaintenanceTargets_(ledgerRows) {
+// - メールアドレスと氏名は、その人の最初の行の値を使う
+// - groups は、チェックが付いている台帳シート名を、出てくる順に重複なく並べる（Group 列に 1 つずつ出力する）
+// - 並びは、その人の最初の行の位置の順
+function mergeMaintenanceTargets_(checkedRows) {
   const byEmail = new Map();
-  ledgerRows.forEach(row => {
+  checkedRows.forEach(row => {
     const key = normalizeEmail_(row.email);
-    const entry = byEmail.get(key) || { person: null, groups: [] };
-    if (!entry.groups.includes(row.sheetName)) {
-      entry.groups.push(row.sheetName);
+    const target = byEmail.get(key);
+    if (!target) {
+      byEmail.set(key, { email: row.email, firstName: row.firstName, lastName: row.lastName, groups: [row.sheetName] });
+    } else if (!target.groups.includes(row.sheetName)) {
+      target.groups.push(row.sheetName);
     }
-    if (row.checked && !entry.person) {
-      entry.person = { email: row.email, firstName: row.firstName, lastName: row.lastName };
-    }
-    byEmail.set(key, entry);
   });
-  return Array.from(byEmail.values())
-    .filter(entry => entry.person)
-    .map(entry => ({
-      email: entry.person.email,
-      firstName: entry.person.firstName,
-      lastName: entry.person.lastName,
-      groups: entry.groups
-    }));
+  return Array.from(byEmail.values());
 }
 
 // listDocusignUsers_ の 1 人分（同じメールアドレスの Docusign ユーザー）から、APIUserName に使うユーザー ID を選ぶ。

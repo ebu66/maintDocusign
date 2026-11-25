@@ -14,7 +14,7 @@ Google スプレッドシートにバインドされた Google Apps Script（GAS
 
 - **`checkGroupMembers`**：`共有事務グループ一覧` シートに載っているグループごとに、台帳シートのメンバーと GWS 上の Google グループのメンバーを比較する。差分を `検査結果` シートに出力し、結果をメールで通知する。
 - **`checkDocusignUsers`**：台帳のメールアドレスが Docusign のユーザーとして登録されているか（登録されていればそのステータス）を確認する。Docusign にあってどの台帳にもないユーザーとあわせて `Docusign確認結果` シートに出力する。メール通知はしない。
-- **`createMaintenanceSheet`**：台帳で C 列（更新対象）にチェックが付いたメンバーを、Docusign のユーザー一括更新用の 8 列の形式で `メンテナンス用CSV` シートに出力する。目的は既存ユーザーの情報の補完（ユーザーの作成は GWS からのプロビジョニングで行う）。APIUserName には、Docusign の全ユーザーを一括取得して照合したユーザー ID を入れる。スプレッドシートのメニュー（`コード.js` の `onOpen`）から呼ばれる。
+- **`createMaintenanceSheet`**：台帳で C 列（更新対象）にチェックが付いたメンバーを、Docusign のユーザー一括更新用の CSV の形式で `メンテナンス用CSV` シートに出力する。目的は既存ユーザーの情報の補完（ユーザーの作成は GWS からのプロビジョニングで行う）。APIUserName には、Docusign の全ユーザーを一括取得して照合したユーザー ID を入れる。スプレッドシートのメニュー（`コード.js` の `onOpen`）から呼ばれる。
 
 <!--
 チェックの付いたメンバーの DocuSign ユーザー ID を DocuSign REST API で検索し、DocuSign のユーザーメンテナンス用 CSV データをシートに出力する。
@@ -62,7 +62,7 @@ clasp open-container  # バインド先のスプレッドシートを開く
   - `normalizeEmail_`：trim と小文字化。メールアドレスの比較・`Map` のキーは必ずこれを通す
   - `prepareResultSheet_`：結果シートがあればクリアし、なければ追加する
   - `listDocusignUsers_`：Docusign の全ユーザー → メールアドレス（`normalizeEmail_` 済み）ごとの `{ name, statuses, accounts: [{ userId, status }] }` の `Map`。`checkDocusignUsers` と `createMaintenanceSheet` が使う
-- 一覧・台帳の見出し行や空行は、行番号ではなく「メールアドレス列に `@` を含むか」で除外している。ただし `createMaintenanceSheet` は、台帳の B 列が空でない行をチェックの有無にかかわらず読み（`readMaintenanceLedgerRows_`）、同じメールアドレスを 1 人にまとめて、どこかで C 列が `true` の人だけを出力する（`mergeMaintenanceTargets_`。Group はそのアドレスがある台帳シート名をすべて `,` でつなぐ）。
+- 一覧・台帳の見出し行や空行は、行番号ではなく「メールアドレス列に `@` を含むか」で除外している。ただし `createMaintenanceSheet` は、台帳の行を「C 列が `true` で B 列が空でないか」で選び（`readCheckedLedgerRows_`）、同じメールアドレスを 1 人にまとめる（`mergeMaintenanceTargets_`）。部署（チェックのある台帳シート名）は Group 列に 1 つずつ並べ、Group 列の数は部署がいちばん多い人に合わせる。Docusign の CSV では、複数のグループは Group 列を増やして指定する（1 つのセルに区切って入れない）。
 - 検査の 2 つ（`checkGroupMembers`・`checkDocusignUsers`）は、エラーをグループ単位で try/catch し、1 グループの失敗で全体を止めない。エラーは結果シートの一覧に行として出し、エラー件数に数える。検査の処理を追加するときはこの方針に合わせる。
 - `createMaintenanceSheet` は逆に、見つからない台帳シートがある、Docusign の一覧を取得できない、ユーザー ID を 1 つに決められない、のどれかで、`メンテナンス用CSV` に書き込む前にエラーで止まる（メニューから実行した人がすぐ気付けるように、一部だけの出力やエラー行は書かない）。ユーザー ID は `selectMaintenanceUserId_` が ActivationSent → Active の順（定数 `CHECKER_MAINTENANCE_USER_STATUSES`）で選び、どちらもいない人は出力せず実行ログに残す。
 - 検査の結果シートは、A:B 列に集計（開始・終了時刻、件数など）を書き、1 行空けて一覧表を書く形式。`メンテナンス用CSV` は集計を書かず、1 行目から見出しと一覧を書く。
